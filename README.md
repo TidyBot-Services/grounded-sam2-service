@@ -10,12 +10,12 @@ http://158.130.109.188:8001
 
 ## Quick Start (Client)
 
-**Only dependency:** `pip install requests`
+No external dependencies — the client uses only Python stdlib (`urllib`).
 
 ```python
-from client import GroundedSAM2Client
+from service_clients.grounded_sam2.client import GroundedSAM2Client
 
-client = GroundedSAM2Client("http://158.130.109.188:8001")
+client = GroundedSAM2Client()  # default: http://158.130.109.188:8001
 
 # Detect objects by text description
 detections = client.detect("photo.jpg", prompts=["red cup", "screwdriver"])
