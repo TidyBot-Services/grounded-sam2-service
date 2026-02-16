@@ -2,7 +2,7 @@
 TidyBot Grounded SAM 2 Service — Python Client SDK
 
 Usage:
-    from services.grounded_sam2.client import GroundedSAM2Client
+    from service_clients.grounded_sam2.client import GroundedSAM2Client
 
     client = GroundedSAM2Client()
     detections = client.detect(image_bytes, prompts=['red cup'])
