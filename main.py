@@ -12,8 +12,10 @@ from typing import Optional
 
 import cv2
 import numpy as np
+import supervision as sv
 import torch
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import Response
 from PIL import Image
 from pydantic import BaseModel, Field
 
@@ -57,7 +59,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="TidyBot Grounded SAM 2 Service",
     description="Open-vocabulary detection + segmentation backend for TidyBot.",
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
@@ -145,6 +147,71 @@ def format_mask(mask_np: np.ndarray, fmt: str):
     return mask_to_polygon(mask_np)
 
 
+# ─── Core Detection Pipeline ─────────────────────────────────────
+def _run_detection(img_pil: Image.Image, img_np: np.ndarray, prompts: list[str],
+                   conf: float, return_masks: bool) -> dict:
+    """
+    Shared detection pipeline used by /detect and /detect/visualize.
+
+    Returns dict with keys: boxes, scores, labels, masks (or None),
+    has_masks, inference_ms, h, w.
+    """
+    h, w = img_np.shape[:2]
+    t0 = time.perf_counter()
+
+    # ── Grounding DINO detection ──
+    text_prompt = " . ".join(prompts) + " ."
+    processor = GROUNDING_MODEL["processor"]
+    model = GROUNDING_MODEL["model"]
+
+    inputs = processor(images=img_pil, text=text_prompt, return_tensors="pt").to(DEVICE)
+    with torch.no_grad():
+        outputs = model(**inputs)
+
+    results = processor.post_process_grounded_object_detection(
+        outputs,
+        inputs.input_ids,
+        threshold=conf,
+        text_threshold=conf,
+        target_sizes=[(h, w)],
+    )[0]
+
+    boxes = results["boxes"].cpu().numpy()   # (N, 4) xyxy
+    scores = results["scores"].cpu().numpy()
+    labels = results["labels"]               # list of strings
+
+    # ── SAM 2 segmentation ──
+    masks = None
+    has_masks = False
+    if return_masks and len(boxes) > 0 and SAM_PREDICTOR is not None:
+        SAM_PREDICTOR.set_image(img_np)
+        masks, _, _ = SAM_PREDICTOR.predict(
+            point_coords=None,
+            point_labels=None,
+            box=boxes.copy(),
+            multimask_output=False,
+        )
+        if masks.ndim == 4:
+            masks = masks.squeeze(1)
+        has_masks = True
+
+    inference_ms = (time.perf_counter() - t0) * 1000
+
+    return {
+        "boxes": boxes, "scores": scores, "labels": labels,
+        "masks": masks, "has_masks": has_masks,
+        "inference_ms": inference_ms, "h": h, "w": w,
+    }
+
+
+def _decode_image(b64: str) -> tuple[Image.Image, np.ndarray]:
+    """Decode base64 image to PIL + numpy."""
+    img_data = base64.b64decode(b64)
+    img_pil = Image.open(io.BytesIO(img_data)).convert("RGB")
+    img_np = np.array(img_pil)
+    return img_pil, img_np
+
+
 # ─── Endpoints ────────────────────────────────────────────────────
 @app.get("/health", response_model=HealthResponse)
 async def health():
@@ -162,84 +229,107 @@ async def health():
     )
 
 
-@app.post("/detect", response_model=DetectResponse)
-async def detect(request: DetectRequest):
-    """Run Grounding DINO detection + optional SAM 2 segmentation."""
-    # Decode image
+@app.post("/visualize")
+async def detect_visualize(
+    request: DetectRequest,
+    fmt: str = Query("jpeg", description="Output image format: 'jpeg' or 'png'"),
+    quality: int = Query(90, description="JPEG quality (1-100), ignored for PNG"),
+):
+    """
+    Run detection + segmentation and return an annotated image with
+    bounding boxes, labels with confidence scores, and mask overlays.
+    """
     try:
-        img_data = base64.b64decode(request.image)
-        img_pil = Image.open(io.BytesIO(img_data)).convert("RGB")
-        img_np = np.array(img_pil)
+        img_pil, img_np = _decode_image(request.image)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid image: {e}")
 
-    h, w = img_np.shape[:2]
-    t0 = time.perf_counter()
+    result = _run_detection(img_pil, img_np, request.prompts, request.conf, request.return_masks)
 
-    # ── Grounding DINO detection ──
-    # Build text prompt: "red cup . screwdriver ."
-    text_prompt = " . ".join(request.prompts) + " ."
+    boxes = result["boxes"]
+    scores = result["scores"]
+    labels = result["labels"]
+    masks = result["masks"]
 
-    processor = GROUNDING_MODEL["processor"]
-    model = GROUNDING_MODEL["model"]
-
-    inputs = processor(images=img_pil, text=text_prompt, return_tensors="pt").to(DEVICE)
-    with torch.no_grad():
-        outputs = model(**inputs)
-
-    results = processor.post_process_grounded_object_detection(
-        outputs,
-        inputs.input_ids,
-        threshold=request.conf,
-        text_threshold=request.conf,
-        target_sizes=[(h, w)],
-    )[0]
-
-    boxes = results["boxes"].cpu().numpy()  # (N, 4) xyxy
-    scores = results["scores"].cpu().numpy()
-    labels = results["labels"]  # list of strings
-
-    # ── SAM 2 segmentation ──
-    masks_list = None
-    has_masks = False
-    if request.return_masks and len(boxes) > 0 and SAM_PREDICTOR is not None:
-        SAM_PREDICTOR.set_image(img_np)
-        # SAM2 expects (N,4) boxes
-        input_boxes = boxes.copy()
-        masks, scores_sam, _ = SAM_PREDICTOR.predict(
-            point_coords=None,
-            point_labels=None,
-            box=input_boxes,
-            multimask_output=False,
+    # Build supervision Detections object
+    n = len(boxes)
+    if n > 0:
+        class_ids = np.arange(n)
+        sv_detections = sv.Detections(
+            xyxy=boxes,
+            confidence=scores,
+            class_id=class_ids,
+            mask=masks.astype(bool) if masks is not None else None,
         )
-        # masks shape: (N, 1, H, W) or (N, H, W)
-        if masks.ndim == 4:
-            masks = masks.squeeze(1)
-        masks_list = masks
-        has_masks = True
+    else:
+        sv_detections = sv.Detections.empty()
 
-    inference_ms = (time.perf_counter() - t0) * 1000
+    # Annotate image
+    annotated = img_np.copy()
+
+    # Mask overlay (draw first so boxes/labels appear on top)
+    if masks is not None and n > 0:
+        mask_annotator = sv.MaskAnnotator(opacity=0.35)
+        annotated = mask_annotator.annotate(scene=annotated, detections=sv_detections)
+
+    # Bounding boxes
+    if n > 0:
+        box_annotator = sv.BoxAnnotator(thickness=2)
+        annotated = box_annotator.annotate(scene=annotated, detections=sv_detections)
+
+    # Labels with confidence
+    if n > 0:
+        text_labels = [
+            f"{labels[i].strip()} {scores[i]:.2f}" for i in range(n)
+        ]
+        label_annotator = sv.LabelAnnotator(text_scale=0.5, text_thickness=1, text_padding=4)
+        annotated = label_annotator.annotate(
+            scene=annotated, detections=sv_detections, labels=text_labels,
+        )
+
+    # Encode output image
+    # Convert RGB -> BGR for cv2
+    annotated_bgr = cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR)
+    if fmt.lower() == "png":
+        _, buf = cv2.imencode(".png", annotated_bgr)
+        media_type = "image/png"
+    else:
+        _, buf = cv2.imencode(".jpg", annotated_bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        media_type = "image/jpeg"
+
+    return Response(content=buf.tobytes(), media_type=media_type)
+
+
+@app.post("/detect", response_model=DetectResponse)
+async def detect(request: DetectRequest):
+    """Run Grounding DINO detection + optional SAM 2 segmentation."""
+    try:
+        img_pil, img_np = _decode_image(request.image)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid image: {e}")
+
+    result = _run_detection(img_pil, img_np, request.prompts, request.conf, request.return_masks)
 
     # Build detections
     detections = []
-    for i in range(len(boxes)):
-        x1, y1, x2, y2 = boxes[i].tolist()
+    for i in range(len(result["boxes"])):
+        x1, y1, x2, y2 = result["boxes"][i].tolist()
         det = Detection(
             bbox=BBox(x1=x1, y1=y1, x2=x2, y2=y2),
-            confidence=float(scores[i]),
-            label=labels[i].strip(),
+            confidence=float(result["scores"][i]),
+            label=result["labels"][i].strip(),
         )
-        if has_masks and masks_list is not None:
-            det.mask = format_mask(masks_list[i].astype(np.uint8), request.mask_format)
+        if result["has_masks"] and result["masks"] is not None:
+            det.mask = format_mask(result["masks"][i].astype(np.uint8), request.mask_format)
         detections.append(det)
 
     return DetectResponse(
         detections=detections,
         device=DEVICE,
-        inference_ms=round(inference_ms, 2),
-        image_width=w,
-        image_height=h,
-        has_masks=has_masks,
+        inference_ms=round(result["inference_ms"], 2),
+        image_width=result["w"],
+        image_height=result["h"],
+        has_masks=result["has_masks"],
     )
 
 
