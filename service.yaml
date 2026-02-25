@@ -1,0 +1,15 @@
+name: grounded-sam2-service
+version: 0.1.0
+description: Open-vocabulary object detection + segmentation using Grounding DINO and SAM 2 on GPU
+
+requires:
+  gpu: true
+  vram_gb: 12
+
+deploy:
+  image: tidybot/grounded-sam2-service:0.1.0
+  port: 8001
+  health: /health
+  ready_timeout: 120
+
+client: client.py
