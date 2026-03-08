@@ -13,7 +13,7 @@ http://158.130.109.188:8001
 No external dependencies — the client uses only Python stdlib (`urllib`).
 
 ```python
-from service_clients.grounded_sam2.client import GroundedSAM2Client
+from client import GroundedSAM2Client  # client.py lives in this repo
 
 client = GroundedSAM2Client()  # default: http://158.130.109.188:8001
 
